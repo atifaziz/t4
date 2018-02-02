@@ -37,7 +37,10 @@ using System.Reflection;
 
 namespace Mono.TextTemplating
 {
-	public class TemplatingEngine : MarshalByRefObject, ITextTemplatingEngine
+    using Microsoft.CodeAnalysis;
+    using Microsoft.CodeAnalysis.CSharp;
+
+    public class TemplatingEngine : MarshalByRefObject, ITextTemplatingEngine
 	{
 		public string ProcessTemplate (string content, ITextTemplatingEngineHost host)
 		{
@@ -173,10 +176,57 @@ namespace Mono.TextTemplating
 				pars.CompilerOptions = "/noconfig";
 			else if (!pars.CompilerOptions.Contains ("/noconfig"))
 				pars.CompilerOptions = "/noconfig " + pars.CompilerOptions;
-			return settings.Provider.CompileAssemblyFromDom (pars, ccu);
+			return CompileAssemblyFromDom (settings.Provider, pars, ccu);
 		}
 
-		static string [] ProcessReferences (ITextTemplatingEngineHost host, ParsedTemplate pt, TemplateSettings settings)
+	    static CompilerResults CompileAssemblyFromDom(CodeDomProvider provider, CompilerParameters pars, CodeCompileUnit ccu)
+	    {
+	        var randomFileName = Path.GetRandomFileName();
+	        var path = Path.Combine(Path.GetTempPath(), randomFileName + ".cs");
+	        var nugetPath = Path.Combine(Environment.GetEnvironmentVariable("HOME") ?? Environment.GetEnvironmentVariable("USERPROFILE"), ".nuget", "packages");
+	        var refs = new[]
+	        {
+	            MetadataReference.CreateFromFile(Path.Combine(nugetPath, "system.runtime", "4.3.0", "ref", "netstandard1.5/System.Runtime.dll"))
+	        };
+            using (var sw = new StreamWriter(path, /* append */ false, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)))
+	            provider.GenerateCodeFromCompileUnit(ccu, sw, new CodeGeneratorOptions());
+	        var args = CSharpCommandLineParser.Default.Parse(new[] {"/target:library"}, Path.GetDirectoryName(path), null);
+	        var tree = CSharpSyntaxTree.ParseText(File.ReadAllText(path));
+	        var compilation = CSharpCompilation.Create(randomFileName + ".dll", new[] {tree}, refs, args.CompilationOptions);
+	        var cr = new CompilerResults(pars.TempFiles);
+	        foreach (var d in from d in compilation.GetDiagnostics()
+	                          where d.Severity == DiagnosticSeverity.Error
+                                 || d.Severity == DiagnosticSeverity.Warning
+	                          let position = d.Location.GetLineSpan().StartLinePosition
+	                          select new CompilerError(path, position.Line, position.Character, d.Id, d.GetMessage())
+	                          {
+	                              IsWarning = d.Severity == DiagnosticSeverity.Warning
+	                          })
+	        {
+	            cr.Errors.Add(d);
+	        }
+
+	        if (cr.Errors.Count == 0)
+	        {
+	            var ms = new MemoryStream();
+	            var er = compilation.Emit(ms);
+	            if (er.Success)
+	            {
+	                ms.Position = 0;
+	                cr.CompiledAssembly = Assembly.Load(ms.ToArray());
+	            }
+	            foreach (var d in from d in er.Diagnostics
+	                              where d.Severity == DiagnosticSeverity.Error
+	                              select d)
+	            {
+	                cr.Errors.Add(new CompilerError(path, 0, 0, d.Id, d.GetMessage()));
+	            }
+	        }
+
+	        return cr;//provider.CompileAssemblyFromDom(pars, ccu);
+	    }
+
+	    static string [] ProcessReferences (ITextTemplatingEngineHost host, ParsedTemplate pt, TemplateSettings settings)
 		{
 			var resolved = new Dictionary<string, string> ();
 
