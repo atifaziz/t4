@@ -37,8 +37,13 @@ using System.Reflection;
 
 namespace Mono.TextTemplating
 {
+    using System.Diagnostics;
+    using System.Runtime.InteropServices.ComTypes;
+    using System.Text.RegularExpressions;
     using Microsoft.CodeAnalysis;
     using Microsoft.CodeAnalysis.CSharp;
+    using Microsoft.CodeAnalysis.CSharp.Scripting;
+    using Microsoft.CodeAnalysis.Scripting;
 
     public class TemplatingEngine : MarshalByRefObject, ITextTemplatingEngine
 	{
@@ -181,49 +186,52 @@ namespace Mono.TextTemplating
 
 	    static CompilerResults CompileAssemblyFromDom(CodeDomProvider provider, CompilerParameters pars, CodeCompileUnit ccu)
 	    {
-	        var randomFileName = Path.GetRandomFileName();
-	        var path = Path.Combine(Path.GetTempPath(), randomFileName + ".cs");
-	        var nugetPath = Path.Combine(Environment.GetEnvironmentVariable("HOME") ?? Environment.GetEnvironmentVariable("USERPROFILE"), ".nuget", "packages");
-	        var refs = new[]
+	        var ns = ccu.Namespaces.Cast<CodeNamespace>().Single();
+	        var td = ns.Types.Cast<CodeTypeDeclaration>().Single();
+
+	        string script;
+	        using (var sw = new StringWriter())
 	        {
-	            MetadataReference.CreateFromFile(Path.Combine(nugetPath, "system.runtime", "4.3.0", "ref", "netstandard1.5/System.Runtime.dll"))
-	        };
-            using (var sw = new StreamWriter(path, /* append */ false, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)))
-	            provider.GenerateCodeFromCompileUnit(ccu, sw, new CodeGeneratorOptions());
-	        var args = CSharpCommandLineParser.Default.Parse(new[] {"/target:library"}, Path.GetDirectoryName(path), null);
-	        var tree = CSharpSyntaxTree.ParseText(File.ReadAllText(path));
-	        var compilation = CSharpCompilation.Create(randomFileName + ".dll", new[] {tree}, refs, args.CompilationOptions);
-	        var cr = new CompilerResults(pars.TempFiles);
-	        foreach (var d in from d in compilation.GetDiagnostics()
-	                          where d.Severity == DiagnosticSeverity.Error
-                                 || d.Severity == DiagnosticSeverity.Warning
-	                          let position = d.Location.GetLineSpan().StartLinePosition
-	                          select new CompilerError(path, position.Line, position.Character, d.Id, d.GetMessage())
-	                          {
-	                              IsWarning = d.Severity == DiagnosticSeverity.Warning
-	                          })
-	        {
-	            cr.Errors.Add(d);
+	            provider.GenerateCodeFromType(td, sw, new CodeGeneratorOptions());
+	            script = sw.ToString();
 	        }
 
-	        if (cr.Errors.Count == 0)
+	        var options =
+	            ScriptOptions.Default
+	                         .AddReferences(typeof(TextTransformation).Assembly)
+	                         .AddImports(from CodeNamespaceImport import in ns.Imports select import.Namespace);
+
+	        var results = new CompilerResults(pars.TempFiles);
+	        IEnumerable<Diagnostic> diagnostics = null;
+
+	        try
 	        {
-	            var ms = new MemoryStream();
-	            var er = compilation.Emit(ms);
-	            if (er.Success)
-	            {
-	                ms.Position = 0;
-	                cr.CompiledAssembly = Assembly.Load(ms.ToArray());
-	            }
-	            foreach (var d in from d in er.Diagnostics
-	                              where d.Severity == DiagnosticSeverity.Error
-	                              select d)
-	            {
-	                cr.Errors.Add(new CompilerError(path, 0, 0, d.Id, d.GetMessage()));
-	            }
+	            var type = CSharpScript.EvaluateAsync<Type>(script + Environment.NewLine + $"typeof({td.Name})", options)
+	                .GetAwaiter().GetResult();
+	            results.CompiledAssembly = type.Assembly;
+	        }
+	        catch (CompilationErrorException e)
+	        {
+	            diagnostics = e.Diagnostics;
 	        }
 
-	        return cr;//provider.CompileAssemblyFromDom(pars, ccu);
+            if (diagnostics != null)
+	        {
+	            var errors =
+	                from d in diagnostics
+                    where d.Severity == DiagnosticSeverity.Error
+	                let loc = d.Location.GetMappedLineSpan()
+	                select new CompilerError(loc.Path,
+	                                         loc.StartLinePosition.Line,
+	                                         loc.StartLinePosition.Character,
+	                                         d.Id,
+	                                         d.GetMessage());
+
+	            foreach (var error in errors)
+	                results.Errors.Add(error);
+	        }
+
+	        return results;
 	    }
 
 	    static string [] ProcessReferences (ITextTemplatingEngineHost host, ParsedTemplate pt, TemplateSettings settings)
@@ -1027,7 +1035,7 @@ namespace Mono.TextTemplating
 			type.Members.Add (helperCls);
 		}
 		
-		#region CodeDom helpers
+#region CodeDom helpers
 		
 		static CodeTypeReference TypeRef<T> ()
 		{
@@ -1132,7 +1140,7 @@ namespace Mono.TextTemplating
 			};
 		}
 
-		#endregion
+#endregion
 
 		//HACK: older versions of Mono don't implement GenerateCodeFromMember
 		// We have a workaround via reflection. First attempt to reflect the members we need to work around it.
@@ -1152,9 +1160,9 @@ namespace Mono.TextTemplating
 				return;
 			}
 
-			#pragma warning disable 0618
+#pragma warning disable 0618
 			var generator = (CodeGenerator) provider.CreateGenerator ();
-			#pragma warning restore 0618
+#pragma warning restore 0618
 			var dummy = new CodeTypeDeclaration ("Foo");
 
 			foreach (CodeTypeMember member in members) {
